@@ -6,3 +6,5 @@ chromadb==0.4.18
 python-dotenv==1.0.0
 pydantic==2.5.2
 pydantic-settings==2.1.0
+numpy==1.24.3  # Pin to version before 2.0
+sentence-transformers==2.2.2
