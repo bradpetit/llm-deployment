@@ -39,9 +39,12 @@ async def chat_endpoint(request: ChatRequest):
     try:
         logger.info("Received chat request")
         
+        # Convert messages to list of dicts for processing
+        messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+        
         # Get last user message for RAG
         last_user_message = next(
-            (msg.content for msg in reversed(request.messages) if msg.role == "user"),
+            (msg["content"] for msg in reversed(messages) if msg["role"] == "user"),
             None
         )
 
@@ -53,7 +56,7 @@ async def chat_endpoint(request: ChatRequest):
 
         # Create prompt with conversation history and context
         prompt = create_chat_prompt(
-            conversation=request.messages,
+            conversation=messages,
             context=context
         )
 
@@ -63,9 +66,6 @@ async def chat_endpoint(request: ChatRequest):
             max_length=request.max_length,
             temperature=request.temperature
         )
-        
-        # Extract just the assistant's response
-        response = response.split("Assistant:")[-1].strip()
         
         logger.info("Generated response successfully")
         return ChatResponse(response=response)
@@ -86,12 +86,3 @@ async def add_document(document: Document):
     except Exception as e:
         logger.error(f"Error adding document: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "main:app",
-        host=settings.API_HOST,
-        port=settings.API_PORT,
-        reload=True
-    )

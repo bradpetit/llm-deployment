@@ -1,6 +1,7 @@
 # app/config.py
 from pydantic_settings import BaseSettings
 from typing import List
+import json
 
 class Settings(BaseSettings):
     # Model Settings
@@ -20,7 +21,19 @@ class Settings(BaseSettings):
     MAX_LENGTH: int = 2048
     DEFAULT_TEMPERATURE: float = 0.7
     
+    # HuggingFace Settings
+    HUGGINGFACE_TOKEN: str
+
     class Config:
         env_file = ".env"
+
+        @classmethod
+        def parse_env_var(cls, field_name: str, raw_val: str):
+            if field_name == "ALLOWED_ORIGINS":
+                try:
+                    return json.loads(raw_val)
+                except json.JSONDecodeError:
+                    return raw_val.split(",")
+            return raw_val
 
 settings = Settings()

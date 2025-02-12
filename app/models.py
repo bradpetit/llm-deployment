@@ -18,3 +18,4 @@ class ChatResponse(BaseModel):
 class Document(BaseModel):
     text: str
     metadata: Optional[Dict] = None
+    
