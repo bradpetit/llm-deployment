@@ -5,9 +5,8 @@ import json
 
 class Settings(BaseSettings):
     # Model Settings
-    MODEL_NAME: str = "mistralai/Mistral-7B-Instruct-v0.2"
-    MODEL_DEVICE: str = "cuda"  # or "cpu"
-    EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"
+    MODEL_NAME: str = "mistral"
+    MODEL_DEVICE: str = "cpu"  # Not needed for Ollama but keep for compatibility
     
     # API Settings
     API_HOST: str = "0.0.0.0"
@@ -16,13 +15,11 @@ class Settings(BaseSettings):
     
     # Database Settings
     CHROMA_DB_PATH: str = "./data/chroma_db"
+    CHROMA_DB_CACHE_PATH: str ="./data/chroma_cache"
     
     # Generation Settings
     MAX_LENGTH: int = 2048
     DEFAULT_TEMPERATURE: float = 0.7
-    
-    # HuggingFace Settings
-    HUGGINGFACE_TOKEN: str
 
     class Config:
         env_file = ".env"

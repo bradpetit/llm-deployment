@@ -4,15 +4,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.models import ChatRequest, ChatResponse, Document
 from app.utils import LLMManager, create_chat_prompt
+from app.admin import router as admin_router
 import logging
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="LLM API with RAG")
 
-# Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS,
@@ -20,13 +19,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(admin_router)
 
-# Initialize LLM Manager
 llm_manager = LLMManager()
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize models on startup"""
     llm_manager.initialize_models()
 
 @app.get("/health")
@@ -52,7 +50,9 @@ async def chat_endpoint(request: ChatRequest):
         context = ""
         if last_user_message:
             relevant_docs = llm_manager.query_knowledge_base(last_user_message)
-            context = "\n".join(relevant_docs)
+            context = "\n\n".join([
+                f"Source {i+1}: {doc}" for i, doc in enumerate(relevant_docs)
+            ])
 
         # Create prompt with conversation history and context
         prompt = create_chat_prompt(
@@ -85,4 +85,48 @@ async def add_document(document: Document):
         return {"message": "Document added successfully", "doc_id": doc_id}
     except Exception as e:
         logger.error(f"Error adding document: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+# New Admin Endpoints
+@app.get("/admin/collections")
+async def list_collections():
+    """List all available collections"""
+    return {"collections": llm_manager.list_collections()}
+
+@app.post("/admin/collections/{name}")
+async def create_collection(name: str):
+    """Create a new collection"""
+    success = llm_manager.create_collection(name)
+    if success:
+        return {"message": f"Collection {name} created successfully"}
+    raise HTTPException(status_code=500, detail="Failed to create collection")
+
+@app.delete("/admin/collections/{name}")
+async def delete_collection(name: str):
+    """Delete a collection"""
+    success = llm_manager.delete_collection(name)
+    if success:
+        return {"message": f"Collection {name} deleted successfully"}
+    raise HTTPException(status_code=500, detail="Failed to delete collection")
+
+@app.get("/admin/documents")
+async def list_documents(collection: str = "knowledge_base"):
+    """List all documents in a collection"""
+    return {"documents": llm_manager.list_documents(collection)}
+
+@app.delete("/admin/documents/{doc_id}")
+async def delete_document(doc_id: str, collection: str = "knowledge_base"):
+    """Delete a specific document"""
+    success = llm_manager.delete_document(doc_id, collection)
+    if success:
+        return {"message": f"Document {doc_id} deleted successfully"}
+    raise HTTPException(status_code=500, detail="Failed to delete document")
+
+@app.post("/admin/test-query")
+async def test_query(query: str, n_results: int = 3):
+    """Test a query and return results with relevance scores"""
+    try:
+        results = llm_manager.test_query(query, n_results)
+        return results
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

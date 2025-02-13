@@ -1,0 +1,50 @@
+# docker-compose.yml
+services:
+  rag-admin:
+    build: .
+    env_file: ".env"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./app:/app/app
+      - ./nginx:/etc/nginx  # Add Nginx configuration volume
+      - /etc/letsencrypt:/etc/letsencrypt  # SSL certificates volume
+      - ./data/chroma_cache:/root/.cache/chroma
+    environment:
+      - VIRTUAL_HOST=ollama.easystreet.studio
+      - LETSENCRYPT_HOST=ollama.easystreet.studio
+    networks:
+      - rag-network
+
+  nginx:
+    image: nginx:latest
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/sites-available:/etc/nginx/sites-available
+      - /etc/letsencrypt:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+    depends_on:
+      - rag-admin
+    networks:
+      - rag-network
+
+  certbot:
+    image: certbot/certbot:v2.6.0
+    volumes:
+      - /etc/letsencrypt:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+    entrypoint: "sh"
+    command: >
+      -c '
+        chmod -R 755 /etc/letsencrypt &&
+        certbot renew --force-renewal
+      '
+    user: root
+
+networks:
+  rag-network:
+    driver: bridge
