@@ -6,14 +6,16 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./data:/app/data
       - ./app:/app/app
       - ./nginx:/etc/nginx  # Add Nginx configuration volume
       - /etc/letsencrypt:/etc/letsencrypt  # SSL certificates volume
-      - ./data/chroma_cache:/root/.cache/chroma
+      - chroma_data:/app/data/chroma_db
+      - chroma_index:/app/data/index
     environment:
       - VIRTUAL_HOST=ollama.easystreet.studio
       - LETSENCRYPT_HOST=ollama.easystreet.studio
+      - CHROMA_DB_PATH=/app/data/chroma_db
+      - CHROMA_DB_INDEX=/app/data/index
     networks:
       - rag-network
 
@@ -44,6 +46,12 @@ services:
         certbot renew --force-renewal
       '
     user: root
+
+volumes:
+  chroma_data:
+    driver: local
+  chroma_index:
+    driver: local 
 
 networks:
   rag-network:

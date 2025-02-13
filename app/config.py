@@ -8,18 +8,22 @@ class Settings(BaseSettings):
     MODEL_NAME: str = "mistral"
     MODEL_DEVICE: str = "cpu"  # Not needed for Ollama but keep for compatibility
     
+    # Add these to your existing settings
+    CHUNK_SIZE: int = 512
+    CHUNK_OVERLAP: int = 50
+    EMBEDDING_MODEL: str = "all-mpnet-base-v2"
+    
     # API Settings
     API_HOST: str = "0.0.0.0"
     API_PORT: int = 8000
     ALLOWED_ORIGINS: List[str] = ["*"]
     
     # Database Settings
-    CHROMA_DB_PATH: str = "./data/chroma_db"
-    CHROMA_DB_CACHE_PATH: str ="./data/chroma_cache"
+    CHROMA_DB_PATH: str = "/app/data/chroma_db"
     
     # Generation Settings
     MAX_LENGTH: int = 2048
-    DEFAULT_TEMPERATURE: float = 0.7
+    DEFAULT_TEMPERATURE: float = 0.5
 
     class Config:
         env_file = ".env"

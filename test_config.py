@@ -10,12 +10,12 @@ def test_settings():
     print(f"API_PORT: {settings.API_PORT}")
     
     # Test HuggingFace token
-    token = settings.HUGGINGFACE_TOKEN
-    if token:
-        # Print first and last 4 characters of token for verification
-        print(f"HuggingFace token found: {token[:4]}...{token[-4:]}")
-    else:
-        print("Warning: No HuggingFace token found!")
+    # token = settings.HUGGINGFACE_TOKEN
+    # if token:
+    #     # Print first and last 4 characters of token for verification
+    #     print(f"HuggingFace token found: {token[:4]}...{token[-4:]}")
+    # else:
+    #     print("Warning: No HuggingFace token found!")
 
 if __name__ == "__main__":
     test_settings()

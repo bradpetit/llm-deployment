@@ -3,7 +3,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.models import ChatRequest, ChatResponse, Document
-from app.utils import LLMManager, create_chat_prompt
+from app.utils import LLMManager
 from app.admin import router as admin_router
 import logging
 
@@ -35,8 +35,6 @@ async def health_check():
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
     try:
-        logger.info("Received chat request")
-        
         # Convert messages to list of dicts for processing
         messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
         
@@ -47,27 +45,20 @@ async def chat_endpoint(request: ChatRequest):
         )
 
         # Query knowledge base if there's a user message
-        context = ""
+        context = []
         if last_user_message:
-            relevant_docs = llm_manager.query_knowledge_base(last_user_message)
-            context = "\n\n".join([
-                f"Source {i+1}: {doc}" for i, doc in enumerate(relevant_docs)
-            ])
+            context = llm_manager.query_knowledge_base(last_user_message)
+        
+        # Convert context to string
+        context_str = "\n".join(context) if context else "No specific venue details found for this query."
 
-        # Create prompt with conversation history and context
-        prompt = create_chat_prompt(
-            conversation=messages,
-            context=context
-        )
-
-        # Generate response
+        # Generate response using the existing system prompt method
         response = llm_manager.generate_response(
-            prompt=prompt,
+            prompt=last_user_message,
             max_length=request.max_length,
             temperature=request.temperature
         )
         
-        logger.info("Generated response successfully")
         return ChatResponse(response=response)
 
     except Exception as e:
