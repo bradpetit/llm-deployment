@@ -54,31 +54,12 @@ class EnhancedEmbedder:
                 # Preprocess text
                 processed_text = self._preprocess_text(text)
                 
-                # Generate embeddings from each model
-                embeddings = []
-                weights = {'mpnet': 0.4, 'minilm': 0.3, 'multiqa': 0.3}
-                
-                # Get embeddings and their dimensions
-                model_embeddings = {}
-                min_dim = float('inf')
-                
-                for model_name, model in self.models.items():
-                    embedding = model.encode(processed_text)
-                    model_embeddings[model_name] = embedding
-                    min_dim = min(min_dim, len(embedding))
-                
-                # Resize all embeddings to the smallest dimension
-                for model_name, weight in weights.items():
-                    embedding = model_embeddings[model_name][:min_dim]
-                    weighted_embedding = embedding * weight
-                    embeddings.append(weighted_embedding)
-                
-                # Combine embeddings
-                combined_embedding = self._combine_embeddings(embeddings)
+                # Use only mpnet model for stable dimensionality
+                embedding = self.models['mpnet'].encode(processed_text)
                 
                 # Apply importance weighting
                 importance_score = self._calculate_importance(processed_text)
-                final_embedding = combined_embedding * importance_score
+                final_embedding = embedding * importance_score
                 
                 # Normalize the final embedding
                 normalized_embedding = self._normalize_embedding(final_embedding)
@@ -90,14 +71,13 @@ class EnhancedEmbedder:
                 
             except Exception as e:
                 logger.error(f"Error processing text: {str(e)}")
-                # Fallback to using just the mpnet model
-                fallback_embedding = self.models['mpnet'].encode(processed_text)
+                # Fallback to basic embedding
+                fallback_embedding = self.models['mpnet'].encode(text)
                 normalized_fallback = self._normalize_embedding(fallback_embedding)
                 all_embeddings.append(normalized_fallback)
         
         # Ensure all embeddings have the same dimension
-        min_dim = min(len(emb) for emb in all_embeddings)
-        return [emb[:min_dim] for emb in all_embeddings]
+        return all_embeddings
 
     def _generate_cache_key(self, text: str) -> str:
         """Generate a cache key for the text"""
@@ -154,17 +134,27 @@ class EnhancedEmbedder:
             # Stack embeddings
             stacked = np.stack(resized_embeddings)
             
-            # Calculate attention scores (simplified attention mechanism)
+            # Calculate attention scores using dot product
             attention_scores = np.matmul(stacked, stacked.T)
-            attention_weights = F.softmax(torch.from_numpy(attention_scores), dim=-1).numpy()
             
-            # Apply attention weights
-            combined = np.sum(stacked * attention_weights.reshape(-1, 1), axis=0)
+            # Convert to PyTorch tensor for softmax
+            attention_weights = F.softmax(torch.from_numpy(attention_scores).float(), dim=-1).numpy()
+            
+            # Reshape attention weights to match stacked embeddings
+            attention_weights = attention_weights.reshape(-1, 1)
+            
+            # Ensure dimensions match for multiplication
+            weighted_embeddings = stacked * attention_weights
+            
+            # Sum along the first axis
+            combined = np.sum(weighted_embeddings, axis=0)
+            
             return combined
+            
         except Exception as e:
             logger.error(f"Error combining embeddings: {str(e)}")
-            # Fallback to using just the first model's embedding
-            return embeddings[0][:min_dim]
+            # Fallback to simple averaging
+            return np.mean(embeddings, axis=0)
     
     def _normalize_embedding(self, embedding: np.ndarray) -> List[float]:
         """Normalize embedding vector"""

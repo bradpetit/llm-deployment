@@ -12,7 +12,7 @@ from datetime import datetime
 from sentence_transformers import SentenceTransformer
 from .enhanced_embedding import EnhancedEmbedder
 from .utils_similarity import SimilarityUtils
-
+from .user_context_manager import UserContextManager, UserContext
 logging.basicConfig(level=logging.INFO)
 
 logger = logging.getLogger(__name__)
@@ -25,6 +25,7 @@ class LLMManager:
         self.chroma_client = None
         self.embedder = None
         self.embedding_function = EnhancedEmbedder()
+        self.context_manager = UserContextManager()
         self.system_prompt = """You are the welcoming digital concierge for The Sunshine Ranch, a premier Northwest wedding and event venue. Use the following retrieved context to answer the question. If you don't know the answer, just say you don't know. Use three sentences maximum and keep the answer concise.
 
 Core Guidelines:
@@ -54,8 +55,8 @@ Context: {context}
 Question: {question}"""
 
     def initialize_models(self):
-        # self.reset_and_initialize_chroma()
-        
+        #self.reset_and_initialize_chroma()
+
         try:
             logger.info("Starting initialization...")
             # Initialize ChromaDB with metadata filtering capability
@@ -66,7 +67,7 @@ Question: {question}"""
             )
             
             # Initialize embedding model
-            self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
+            self.embedder = SentenceTransformer('all-mpnet-base-v2')
             
             # Check Ollama connection
             response = requests.get(f"{self.base_url}/tags")
@@ -319,14 +320,17 @@ Question: {question}"""
         """Calculate comprehensive relevance score using cosine similarity"""
         try:
             # Get embeddings for query and document
-            query_embedding = self.embedding_function([query])[0]
-            doc_embedding = self.embedding_function([document])[0]
+            query_embedding = np.array(self.embedding_function([query])[0])
+            doc_embedding = np.array(self.embedding_function([document])[0])
             
-            # Calculate cosine similarity using SimilarityUtils
-            similarity_score = float(SimilarityUtils.cosine_similarity(
-                torch.tensor(query_embedding),
-                torch.tensor(doc_embedding).unsqueeze(0)
-            ))
+            # Ensure embeddings are 2D arrays
+            query_embedding = query_embedding.reshape(1, -1)
+            doc_embedding = doc_embedding.reshape(1, -1)
+            
+            # Calculate cosine similarity using numpy directly
+            similarity_score = np.dot(query_embedding, doc_embedding.T)[0, 0] / (
+                np.linalg.norm(query_embedding) * np.linalg.norm(doc_embedding)
+            )
             
             # Calculate keyword overlap
             query_words = set(query.lower().split())
@@ -336,9 +340,9 @@ Question: {question}"""
             # Consider metadata importance if available
             importance_score = float(metadata.get('importance_score', 0.5))
             
-            # Weighted combination with cosine similarity
+            # Weighted combination
             weights = {
-                'similarity': 0.6,    # Increased weight for cosine similarity
+                'similarity': 0.6,
                 'keyword_overlap': 0.25,
                 'importance': 0.15
             }
@@ -349,7 +353,7 @@ Question: {question}"""
                 importance_score * weights['importance']
             )
             
-            return min(max(final_score, 0.0), 1.0)  # Ensure score is between 0 and 1
+            return float(min(max(final_score, 0.0), 1.0))
             
         except Exception as e:
             logger.error(f"Error calculating relevance score: {str(e)}")
@@ -472,97 +476,49 @@ Question: {question}"""
             logger.error(f"Error getting similarities: {str(e)}")
             return []
 
-    # def generate_response(self,
-    #     prompt: str,
-    #     context: Optional[List[str]] = None,
-    #     metadata_filters: Optional[Dict] = None,
-    #     max_length: Optional[int] = None,
-    #     temperature: Optional[float] = None) -> str:
-
-    #     """Generate response with enhanced context integration"""
-    #     try:
-    #        # Get context if not provided
-    #         if context is None:
-    #             context = self.query_knowledge_base(
-    #                 query=prompt,
-    #                 filters=metadata_filters
-    #             )
-            
-    #         context_str = "\n".join(context) if context else "No specific venue details found."
-
-    #         # Format prompt with context
-    #         formatted_prompt = self.system_prompt.format(
-    #             context=context_str,
-    #             question=prompt
-    #         )
-
-    #         # Process and combine context
-    #         if context:
-    #             # Remove duplicate information
-    #             seen_content = set()
-    #             unique_context = []
-    #             for c in context:
-    #                 if c not in seen_content:
-    #                     unique_context.append(c)
-    #                     seen_content.add(c)
-                
-    #             context_str = "\n\nRelevant Information:\n" + "\n".join(
-    #                 f"- {c}" for c in unique_context
-    #             )
-    #         else:
-    #             context_str = "No specific venue details found for this query."
-
-    #         # Format prompt with context
-    #         formatted_prompt = self.system_prompt.format(
-    #             context=context_str,
-    #             question=prompt
-    #         )
-
-    #         # Generate response
-    #         data = {
-    #             "model": self.model,
-    #             "prompt": formatted_prompt,
-    #             "stream": False,
-    #             "temperature": temperature or settings.DEFAULT_TEMPERATURE,
-    #             "max_length": max_length or settings.MAX_LENGTH
-    #         }
-            
-    #         response = requests.post(f"{self.base_url}/generate", json=data)
-            
-    #         if response.status_code == 200:
-    #             response_text = response.json()["response"].strip()
-    #             return self._clean_response(response_text)
-    #         else:
-    #             raise Exception(f"Error from Ollama API: {response.text}")
-            
-    #     except Exception as e:
-    #         logger.error(f"Error during response generation: {str(e)}")
-    #         raise
-
     def generate_response(
         self,
         prompt: str,
+        message_history: List[Dict[str, str]] = None,
+        user_id: Optional[str] = None,
         max_length: Optional[int] = None,
         temperature: Optional[float] = None
-    ) -> str:
-        """Generate response with enhanced logging"""
+    ) -> tuple[str, Optional[UserContext]]:
+        """Generate response with user context awareness"""
         try:
             logger.info(f"Starting generate_response with prompt: {prompt[:100]}...")
-            logger.info(f"Parameters - max_length: {max_length}, temperature: {temperature}")
             
-            # Get relevant context
-            logger.info("Querying knowledge base...")
-            context = self.query_knowledge_base(prompt)
-            context_str = "\n".join(context) if context else "No specific venue details found."
-            logger.info(f"Retrieved context length: {len(context_str)}")
-
-            # Format prompt with context
+            # Update user context if user_id provided
+            user_context = None
+            if user_id:
+                user_context = self.context_manager.update_context(user_id, prompt)
+                context_prompt = self.context_manager.format_context_for_prompt(user_context)
+            else:
+                context_prompt = ""
+            
+            # Get relevant context from knowledge base
+            rag_context = self.query_knowledge_base(prompt)
+            rag_context_str = "\n".join(rag_context) if rag_context else "No specific venue details found."
+            
+            # Format conversation history
+            conversation_context = ""
+            if message_history:
+                recent_messages = message_history[-5:]
+                conversation_context = "\n".join([
+                    f"{'User' if msg['role'] == 'user' else 'Assistant'}: {msg['content']}"
+                    for msg in recent_messages
+                ])
+                conversation_context = f"\nPrevious conversation:\n{conversation_context}\n"
+            
+            # Combine all context
+            full_context = f"{rag_context_str}\n{context_prompt}\n{conversation_context}".strip()
+            
+            # Update system prompt with user context
             formatted_prompt = self.system_prompt.format(
-                context=context_str,
+                context=full_context,
                 question=prompt
             )
-            logger.info(f"Formatted prompt length: {len(formatted_prompt)}")
-
+            
             # Generate response
             data = {
                 "model": self.model,
@@ -575,10 +531,6 @@ Question: {question}"""
             logger.info(f"Sending request to Ollama API at {self.base_url}")
             response = requests.post(f"{self.base_url}/generate", json=data)
             
-            # Log response status and headers
-            logger.info(f"Ollama API response status: {response.status_code}")
-            logger.info(f"Ollama API response headers: {dict(response.headers)}")
-            
             if response.status_code == 200:
                 response_json = response.json()
                 logger.info("Successfully received JSON response from Ollama")
@@ -588,19 +540,13 @@ Question: {question}"""
                     raise ValueError("Invalid response format from Ollama API")
                 
                 response_text = response_json["response"].strip()
-                cleaned_response = response_text.replace("Assistant:", "").replace("User:", "").strip()
-                logger.info(f"Final response length: {len(cleaned_response)}")
-                return cleaned_response
+                cleaned_response = self._clean_response(response_text)
+                
+                return cleaned_response, user_context
             else:
                 logger.error(f"Error response from Ollama API: {response.text}")
                 raise Exception(f"Error from Ollama API: {response.text}")
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Network error with Ollama API: {str(e)}")
-            raise
-        except json.JSONDecodeError as e:
-            logger.error(f"Error decoding Ollama API response: {str(e)}")
-            raise
+                
         except Exception as e:
             logger.error(f"Error in generate_response: {str(e)}")
             import traceback

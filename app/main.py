@@ -1,4 +1,5 @@
 # app/main.py
+import traceback
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
@@ -35,64 +36,39 @@ async def health_check():
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
     try:
-        import traceback
         logger.info(f"Received chat request with {len(request.messages)} messages")
-        logger.info(f"Request content: {request.dict()}")
         
         # Convert messages to list of dicts for processing
         messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
-        logger.info(f"Processed messages: {messages}")
         
-        # Get last user message for RAG
+        # Get last user message
         last_user_message = next(
             (msg["content"] for msg in reversed(messages) if msg["role"] == "user"),
             None
         )
         
         if not last_user_message:
-            logger.error("No user message found in request")
             raise HTTPException(status_code=400, detail="No user message found")
 
-        logger.info(f"Processing user message: {last_user_message}")
-        logger.info(f"Max length: {request.max_length}")
-        logger.info(f"Temperature: {request.temperature}")
-
-        try:
-            # Query knowledge base first to check if it's working
-            context = llm_manager.query_knowledge_base(last_user_message)
-            logger.info(f"Retrieved context: {context}")
-            
-            # Generate response
-            response = llm_manager.generate_response(
-                prompt=last_user_message,
-                max_length=request.max_length,
-                temperature=request.temperature
-            )
-            
-            if not response:
-                logger.error("Empty response received from generate_response")
-                raise ValueError("Empty response from LLM")
-            
-            logger.info(f"Generated response successfully: {response[:100]}...")
-            return ChatResponse(response=response)
-
-        except Exception as e:
-            logger.error(f"Error generating response: {str(e)}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Error in response generation: {str(e)}"
-            )
-
+        # Generate response with user context
+        response, updated_context = llm_manager.generate_response(
+            prompt=last_user_message,
+            message_history=messages,
+            user_id=request.user_id,  # Pass the user_id if provided
+            max_length=request.max_length,
+            temperature=request.temperature
+        )
+        
+        return ChatResponse(
+            response=response,
+            updated_context=updated_context
+        )
+        
     except Exception as e:
         logger.error(f"Error in chat endpoint: {str(e)}")
         logger.error(f"Traceback: {traceback.format_exc()}")
-        # Return a more detailed error message
         error_detail = str(e) if str(e) else "Internal server error occurred"
-        raise HTTPException(
-            status_code=500,
-            detail=error_detail
-        )
+        raise HTTPException(status_code=500, detail=error_detail)
 
 @app.post("/documents")
 async def add_document(document: Document):
