@@ -1,237 +1,21 @@
 # app/utils.py
-from datetime import datetime
 import json
 import re
 import requests
 import logging
-from typing import List, Dict, Optional, Any, Tuple, Union
-import chromadb
-from app.config import settings
-import torch
-from sentence_transformers import SentenceTransformer
 import numpy as np
-from torch.nn import functional as F
-import spacy
-from chromadb.api.types import Documents, Embeddings
-from .text_chunking import TextChunk, EnhancedChunker
+import chromadb
+import torch
+from typing import List, Dict, Optional, Any, Union
+from app.config import settings
+from datetime import datetime
+from sentence_transformers import SentenceTransformer
+from .enhanced_embedding import EnhancedEmbedder
+from .utils_similarity import SimilarityUtils
 
 logging.basicConfig(level=logging.INFO)
 
 logger = logging.getLogger(__name__)
-
-class EnhancedEmbedder:
-    def __init__(self):
-
-        self.model = SentenceTransformer('all-mpnet-base-v2')
-        self.chunker = EnhancedChunker()
-        
-        try:
-            self.nlp = spacy.load('en_core_web_sm')
-        except OSError:
-            logger.info("Downloading spaCy model...")
-            import subprocess
-            subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"])
-            self.nlp = spacy.load('en_core_web_sm')
-        
-        self.chunk_size = 512
-        self.chunk_overlap = 50
-
-    def __call__(self, input: List[str]) -> List[List[float]]:
-        """
-        ChromaDB-compatible embedding function
-        Args:
-            input: List of strings to embed
-        Returns:
-            List of embeddings as float lists
-        """
-        
-        all_chunks = []
-        for text in input:
-            chunks = self.chunker.create_chunks(text, strategy='hybrid')
-            all_chunks.extend([chunk.text for chunk in chunks])
-
-        # Generate embeddings
-        embeddings = self.model.encode(all_chunks)
-        
-        # Calculate importance scores for weighting
-        importance_scores = [self.calculate_chunk_importance(text) for text in all_chunks]
-
-        if importance_scores:
-            max_score = max(importance_scores)
-            importance_scores = [score/max_score for score in importance_scores]
-            
-            # Weight embeddings by importance (optional)
-            weighted_embeddings = []
-            for emb, score in zip(embeddings, importance_scores):
-                weighted_emb = emb * score
-                weighted_embeddings.append(weighted_emb)
-            embeddings = weighted_embeddings
-
-        return [embedding.tolist() for embedding in embeddings]
-
-    def create_semantic_chunks(self, text: str) -> List[str]:
-        """Create semantic chunks from text"""
-        doc = self.nlp(text)
-        chunks = []
-        current_chunk = []
-        current_size = 0
-        
-        for sent in doc.sents:
-            sent_size = len(sent.text.split())
-            
-            if current_size + sent_size <= self.chunk_size:
-                current_chunk.append(sent.text)
-                current_size += sent_size
-            else:
-                if current_chunk:
-                    chunks.append(" ".join(current_chunk))
-                current_chunk = [sent.text]
-                current_size = sent_size
-        
-        if current_chunk:
-            chunks.append(" ".join(current_chunk))
-            
-        return chunks if chunks else [text]
-
-    def preprocess_text(self, text: str) -> str:
-        """Clean and normalize text"""
-        text = re.sub(r'\s+', ' ', text)
-        text = re.sub(r'[""'']', '"', text)
-        text = re.sub(r'[–—]', '-', text)
-        return text.strip()
-
-    def calculate_chunk_importance(self, text: str) -> float:
-        """Calculate importance score for text"""
-        doc = self.nlp(text)
-        
-        entity_score = len(doc.ents) * 0.5
-        noun_phrase_score = len(list(doc.noun_chunks)) * 0.3
-        keyword_score = sum(1 for token in doc 
-                          if token.pos_ in ['NOUN', 'VERB'] 
-                          and not token.is_stop) * 0.2
-        
-        return entity_score + noun_phrase_score + keyword_score
-
-
-class SimilarityUtils:
-    @staticmethod
-    def cosine_similarity(
-        query_embedding: Union[torch.Tensor, np.ndarray],
-        document_embeddings: Union[torch.Tensor, np.ndarray]
-    ) -> torch.Tensor:
-        """
-        Calculate cosine similarity between query and document embeddings.
-        
-        Args:
-            query_embedding: Single query embedding vector
-            document_embeddings: Matrix of document embeddings
-            
-        Returns:
-            Tensor of similarity scores for each document
-        """
-        # Convert to torch tensors if needed
-        if isinstance(query_embedding, np.ndarray):
-            query_embedding = torch.from_numpy(query_embedding)
-        if isinstance(document_embeddings, np.ndarray):
-            document_embeddings = torch.from_numpy(document_embeddings)
-        
-        # Ensure query_embedding is 2D
-        if query_embedding.dim() == 1:
-            query_embedding = query_embedding.unsqueeze(0)
-        
-        # Normalize embeddings
-        query_embedding = F.normalize(query_embedding, p=2, dim=1)
-        document_embeddings = F.normalize(document_embeddings, p=2, dim=1)
-        
-        # Calculate cosine similarity
-        similarities = torch.mm(query_embedding, document_embeddings.t())
-        return similarities.squeeze()
-
-    @staticmethod
-    def rank_documents(
-        similarities: torch.Tensor,
-        documents: List[str],
-        metadatas: List[Dict],
-        top_k: int = 5,
-        threshold: float = 0.5,
-        similarity_weight: float = 0.7,
-        importance_weight: float = 0.3
-    ) -> List[Dict]:
-        """
-        Rank documents based on similarities and metadata importance.
-        
-        Args:
-            similarities: Tensor of similarity scores
-            documents: List of document texts
-            metadatas: List of document metadata dictionaries
-            top_k: Number of top documents to return
-            threshold: Minimum score threshold
-            similarity_weight: Weight for similarity score in final ranking
-            importance_weight: Weight for importance score in final ranking
-            
-        Returns:
-            List of dictionaries containing ranked documents with scores
-        """
-        # Convert similarities to numpy for easier handling
-        similarities = similarities.cpu().numpy()
-        
-        # Combine with metadata importance scores
-        ranked_results = []
-        for i, (sim_score, doc, meta) in enumerate(zip(similarities, documents, metadatas)):
-            # Get importance score from metadata if available
-            importance = meta.get('importance_score', 0.5)
-            
-            # Calculate final score (weighted combination)
-            final_score = (sim_score * similarity_weight) + (importance * importance_weight)
-            
-            # Only include if above threshold
-            if final_score >= threshold:
-                ranked_results.append({
-                    'text': doc,
-                    'similarity': float(sim_score),
-                    'importance': importance,
-                    'final_score': float(final_score),
-                    'metadata': meta
-                })
-        
-        # Sort by final score and get top_k
-        ranked_results.sort(key=lambda x: x['final_score'], reverse=True)
-        return ranked_results[:top_k]
-    
-    @staticmethod
-    def get_similar_chunks(
-        query_embedding: Union[torch.Tensor, np.ndarray],
-        chunk_embeddings: Union[torch.Tensor, np.ndarray],
-        chunks: List[str],
-        min_similarity: float = 0.5
-    ) -> List[Tuple[str, float]]:
-        """
-        Find similar chunks based on cosine similarity.
-        
-        Args:
-            query_embedding: Query embedding vector
-            chunk_embeddings: Matrix of chunk embeddings
-            chunks: List of text chunks
-            min_similarity: Minimum similarity threshold
-            
-        Returns:
-            List of tuples containing (chunk_text, similarity_score)
-        """
-        # Calculate similarities
-        similarities = SimilarityUtils.cosine_similarity(query_embedding, chunk_embeddings)
-        
-        # Convert to numpy
-        similarities = similarities.cpu().numpy()
-        
-        # Filter and sort results
-        similar_chunks = []
-        for chunk, score in zip(chunks, similarities):
-            if score >= min_similarity:
-                similar_chunks.append((chunk, float(score)))
-        
-        # Sort by similarity score
-        similar_chunks.sort(key=lambda x: x[1], reverse=True)
-        return similar_chunks
 
 class LLMManager:
     def __init__(self):
@@ -270,6 +54,8 @@ Context: {context}
 Question: {question}"""
 
     def initialize_models(self):
+        # self.reset_and_initialize_chroma()
+        
         try:
             logger.info("Starting initialization...")
             # Initialize ChromaDB with metadata filtering capability

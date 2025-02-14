@@ -1,11 +1,11 @@
 # app/config.py
 from pydantic_settings import BaseSettings
-from typing import List
+from typing import Dict, List
 import json
 
 class Settings(BaseSettings):
     # Model Settings
-    MODEL_NAME: str = "mistral"
+    MODEL_NAME: str = "llama2"
     MODEL_DEVICE: str = "cpu"  # Not needed for Ollama but keep for compatibility
     
     # RAG-specific settings
@@ -15,11 +15,14 @@ class Settings(BaseSettings):
     MIN_SIMILARITY_SCORE: float = 0.6
     MAX_CONTEXT_CHUNKS: int = 3
     RERANKING_ENABLED: bool = True
-    
-    # Add these to your existing settings
     CHUNK_SIZE: int = 512
-    CHUNK_OVERLAP: int = 50
     EMBEDDING_MODEL: str = "all-mpnet-base-v2"
+    EMBEDDING_CACHE_SIZE: int = 10000
+    EMBEDDING_ENSEMBLE_WEIGHTS: Dict[str, float] = {
+        'mpnet': 0.4,
+        'minilm': 0.3,
+        'multiqa': 0.3
+    }
     
     # API Settings
     API_HOST: str = "0.0.0.0"
