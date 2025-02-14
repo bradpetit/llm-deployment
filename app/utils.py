@@ -260,11 +260,11 @@ Key Features to Reference:
 - Easy accessibility and ample parking
 
 Standard Responses:
-1. For date inquiries: "To check specific dates, please email thesunshineranch.events@gmail.com"
-2. For detailed pricing: "While our packages start at $4999.00, I'd love to arrange a consultation to discuss your specific needs"
-3. For availability: "Our dates are filling quickly. Let's schedule a tour to explore your options"
+1. For date inquiries: "To check specific dates, please email thesunshineranch.events@gmail.com or call 1 (509)387-1279"
+2. For detailed pricing: "Our packages are between $4999.00 for up to 50 and $7999.00 for up to 300 people, I'd love to arrange a consultation to discuss your specific needs. Please email us at thesunshineranch.events@gmail.com"
+3. For availability: "Our dates are filling quickly. Let's schedule a tour to explore your options. Please email us at thesunshineranch.events@gmail.com or call 1 (509)387-1270"
 
-Remember: Share venue highlights naturally, and sometimes conclude with ONE engagement prompt (e.g., "Would you like to schedule a private tour?")
+Remember: Share venue highlights naturally, and sometimes conclude with ONE engagement prompt (e.g., "Would you like to schedule a private tour? Send us an email.")
 
 Context: {context}
 Question: {question}"""
@@ -491,59 +491,102 @@ Question: {question}"""
                 converted[key] = value
         return converted
 
-    def query_knowledge_base(self, query: str, n_results: int = 2) -> List[str]:
-        """Enhanced query processing with explicit cosine similarity"""
+    def query_knowledge_base(self, query: str, n_results: int = 3) -> List[str]:
         try:
-            # Preprocess query
-            processed_query = self.embedding_function.preprocess_text(query)
+            # Enhance query first
+            enhanced_query = self._enhance_query(query)
             
-            # Get query embedding
-            query_embedding = self.embedding_function([processed_query])[0]
-            
-            # Get all documents and their data
-            results = self.collection.get()
-            
-            # Check if we have any documents
-            if not results['ids'] or not results['documents']:
-                logger.info("No documents found in collection")
-                return []
-                
-            documents = results['documents']
-            embeddings = results['embeddings']
-            metadatas = results['metadatas']
-            
-            # Verify we have matching lengths
-            if not (len(documents) == len(embeddings) == len(metadatas)):
-                logger.error(f"Mismatched lengths: docs={len(documents)}, embeddings={len(embeddings)}, metadata={len(metadatas)}")
-                return []
-
-            # Calculate similarities using SimilarityUtils
-            similarities = SimilarityUtils.cosine_similarity(
-                query_embedding=np.array(query_embedding),
-                document_embeddings=np.array(embeddings)
+            # Get initial results
+            results = self.collection.query(
+                query_texts=[enhanced_query],
+                n_results=n_results * 2  # Get more results initially
             )
             
-            # Rank documents with custom weights and thresholds
-            ranked_results = SimilarityUtils.rank_documents(
-                similarities=similarities,
-                documents=documents,
-                metadatas=metadatas,
-                top_k=n_results,
-                threshold=0.5,  # Minimum relevance threshold
-                similarity_weight=0.7,  # Weight for similarity in final score
-                importance_weight=0.3   # Weight for metadata importance
-            )
+            if not results or not results['documents']:
+                return []
             
-            # Extract and return the text from ranked results
-            return [result['text'] for result in ranked_results]
-
-        except IndexError as e:
-            logger.error(f"Index error in query_knowledge_base: {str(e)}")
-            return []
+            # Process and rerank results
+            documents = results['documents'][0]
+            metadatas = results['metadatas'][0]
+            distances = results['distances'][0]
+            
+            # Rerank based on both semantic similarity and content relevance
+            reranked_results = []
+            for doc, meta, dist in zip(documents, metadatas, distances):
+                relevance_score = self._calculate_relevance_score(
+                    query=query,
+                    document=doc,
+                    distance=dist,
+                    metadata=meta
+                )
+                reranked_results.append((doc, relevance_score))
+            
+            # Sort by relevance score and take top n_results
+            reranked_results.sort(key=lambda x: x[1], reverse=True)
+            return [doc for doc, _ in reranked_results[:n_results]]
+            
         except Exception as e:
             logger.error(f"Error in enhanced query: {str(e)}")
             return []
+        
+    def _calculate_relevance_score(self, query: str, document: str, distance: float, metadata: Dict) -> float:
+        """Calculate comprehensive relevance score using cosine similarity"""
+        try:
+            # Get embeddings for query and document
+            query_embedding = self.embedding_function([query])[0]
+            doc_embedding = self.embedding_function([document])[0]
+            
+            # Calculate cosine similarity using SimilarityUtils
+            similarity_score = float(SimilarityUtils.cosine_similarity(
+                torch.tensor(query_embedding),
+                torch.tensor(doc_embedding).unsqueeze(0)
+            ))
+            
+            # Calculate keyword overlap
+            query_words = set(query.lower().split())
+            doc_words = set(document.lower().split())
+            keyword_overlap = len(query_words.intersection(doc_words)) / len(query_words) if query_words else 0
+            
+            # Consider metadata importance if available
+            importance_score = float(metadata.get('importance_score', 0.5))
+            
+            # Weighted combination with cosine similarity
+            weights = {
+                'similarity': 0.6,    # Increased weight for cosine similarity
+                'keyword_overlap': 0.25,
+                'importance': 0.15
+            }
+            
+            final_score = (
+                similarity_score * weights['similarity'] +
+                keyword_overlap * weights['keyword_overlap'] +
+                importance_score * weights['importance']
+            )
+            
+            return min(max(final_score, 0.0), 1.0)  # Ensure score is between 0 and 1
+            
+        except Exception as e:
+            logger.error(f"Error calculating relevance score: {str(e)}")
+            return 0.0
 
+    def _enhance_query(self, query: str) -> str:
+        """Enhance query with contextual understanding"""
+        # Split multi-part questions
+        questions = [q.strip() for q in query.split('?') if q.strip()]
+        
+        # Extract key entities and concepts
+        doc = self.embedding_function.nlp(query)
+        entities = [ent.text for ent in doc.ents]
+        key_phrases = [chunk.text for chunk in doc.noun_chunks]
+        
+        # Combine all relevant parts
+        enhanced_parts = []
+        enhanced_parts.extend(questions)
+        enhanced_parts.extend(entities)
+        enhanced_parts.extend(key_phrases)
+        
+        return ' '.join(set(enhanced_parts))
+    
     def get_document(self, doc_id: str) -> Optional[Dict]:
         """
         Retrieve a document and its metadata by ID, converting metadata back to original types

@@ -8,6 +8,14 @@ class Settings(BaseSettings):
     MODEL_NAME: str = "mistral"
     MODEL_DEVICE: str = "cpu"  # Not needed for Ollama but keep for compatibility
     
+    # RAG-specific settings
+    CHUNK_MIN_SIZE: int = 100
+    CHUNK_MAX_SIZE: int = 512
+    CHUNK_OVERLAP: int = 50
+    MIN_SIMILARITY_SCORE: float = 0.6
+    MAX_CONTEXT_CHUNKS: int = 3
+    RERANKING_ENABLED: bool = True
+    
     # Add these to your existing settings
     CHUNK_SIZE: int = 512
     CHUNK_OVERLAP: int = 50

@@ -1,4 +1,4 @@
-from typing import List, Dict
+from typing import List, Dict, Optional
 import spacy
 from dataclasses import dataclass
 import logging
@@ -211,3 +211,94 @@ class EnhancedChunker:
         # Add final chunk
         merged.append(current_chunk)
         return merged
+    
+    def _semantic_chunking(self, text: str) -> List[TextChunk]:
+        """Enhanced semantic chunking with better boundary detection"""
+        doc = self.nlp(text)
+        chunks = []
+        current_chunk = []
+        current_length = 0
+        current_entities = set()
+        
+        for sent in doc.sents:
+            sent_text = sent.text.strip()
+            sent_length = len(sent_text.split())
+            sent_entities = {ent.text for ent in sent.ents}
+            
+            # Check if adding this sentence would break entity coherence
+            if current_chunk and current_length + sent_length > self.max_chunk_size:
+                # Check if we should start new chunk or continue current one
+                if sent_entities & current_entities:  # Has overlapping entities
+                    # Try to find better break point
+                    break_point = self._find_break_point(current_chunk)
+                    if break_point:
+                        new_chunk = current_chunk[:break_point]
+                        remainder = current_chunk[break_point:]
+                        
+                        chunk = self._create_chunk_with_metadata(
+                            text=' '.join(new_chunk),
+                            start_pos=doc[doc.char_span(0, len(' '.join(new_chunk))).start].idx,
+                            end_pos=doc[doc.char_span(0, len(' '.join(new_chunk))).end].idx
+                        )
+                        chunks.append(chunk)
+                        
+                        current_chunk = remainder + [sent_text]
+                        current_length = sum(len(s.split()) for s in current_chunk)
+                        current_entities = sent_entities
+                        continue
+                
+                # Create new chunk
+                chunk = self._create_chunk_with_metadata(
+                    text=' '.join(current_chunk),
+                    start_pos=doc[doc.char_span(0, len(' '.join(current_chunk))).start].idx,
+                    end_pos=doc[doc.char_span(0, len(' '.join(current_chunk))).end].idx
+                )
+                chunks.append(chunk)
+                
+                current_chunk = [sent_text]
+                current_length = sent_length
+                current_entities = sent_entities
+            else:
+                current_chunk.append(sent_text)
+                current_length += sent_length
+                current_entities.update(sent_entities)
+        
+        # Add final chunk
+        if current_chunk:
+            chunk = self._create_chunk_with_metadata(
+                text=' '.join(current_chunk),
+                start_pos=doc[doc.char_span(0, len(' '.join(current_chunk))).start].idx,
+                end_pos=doc[doc.char_span(0, len(' '.join(current_chunk))).end].idx
+            )
+            chunks.append(chunk)
+        
+        return chunks
+
+    def _find_break_point(self, sentences: List[str]) -> Optional[int]:
+        """Find optimal break point in chunk based on semantic coherence"""
+        if len(sentences) <= 2:
+            return None
+            
+        max_coherence = -1
+        best_break = None
+        
+        for i in range(1, len(sentences)-1):
+            # Calculate coherence score for potential split
+            before = ' '.join(sentences[:i])
+            after = ' '.join(sentences[i:])
+            
+            before_doc = self.nlp(before)
+            after_doc = self.nlp(after)
+            
+            # Consider entity continuity
+            before_entities = set(ent.text for ent in before_doc.ents)
+            after_entities = set(ent.text for ent in after_doc.ents)
+            
+            # Calculate coherence score
+            coherence = len(before_entities & after_entities)
+            
+            if coherence > max_coherence:
+                max_coherence = coherence
+                best_break = i
+        
+        return best_break
