@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     
     # Generation Settings
     MAX_LENGTH: int = 2048
-    DEFAULT_TEMPERATURE: float = 0.5
+    DEFAULT_TEMPERATURE: float = 0.65
 
     class Config:
         env_file = ".env"

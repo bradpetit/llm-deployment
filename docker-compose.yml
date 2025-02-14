@@ -11,11 +11,14 @@ services:
       - /etc/letsencrypt:/etc/letsencrypt  # SSL certificates volume
       - chroma_data:/app/data/chroma_db
       - chroma_index:/app/data/index
+      - model_cache:/root/.cache  # Changed to parent cache directory
     environment:
       - VIRTUAL_HOST=ollama.easystreet.studio
       - LETSENCRYPT_HOST=ollama.easystreet.studio
       - CHROMA_DB_PATH=/app/data/chroma_db
       - CHROMA_DB_INDEX=/app/data/index
+      - TRANSFORMERS_CACHE=/root/.cache/huggingface
+      - HF_HOME=/root/.cache/huggingface
     networks:
       - rag-network
 
@@ -35,7 +38,7 @@ services:
       - rag-network
 
   certbot:
-    image: certbot/certbot:v2.6.0
+    image: certbot/certbot
     volumes:
       - /etc/letsencrypt:/etc/letsencrypt
       - ./certbot/www:/var/www/certbot
@@ -51,7 +54,9 @@ volumes:
   chroma_data:
     driver: local
   chroma_index:
-    driver: local 
+    driver: local
+  model_cache:    
+    driver: local
 
 networks:
   rag-network:

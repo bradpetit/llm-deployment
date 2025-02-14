@@ -22,6 +22,10 @@ ENV VIRTUAL_ENV=/opt/venv
 RUN python -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
+# Set cache permissions upfront
+RUN mkdir -p /root/.cache/huggingface && \
+    chmod -R 777 /root/.cache
+
 # Upgrade pip first
 RUN python -m pip install --no-cache-dir --upgrade pip
 

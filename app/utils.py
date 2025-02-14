@@ -1,26 +1,30 @@
 # app/utils.py
+from datetime import datetime
+import json
 import re
 import requests
 import logging
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple, Union
 import chromadb
 from app.config import settings
 import torch
 from sentence_transformers import SentenceTransformer
 import numpy as np
+from torch.nn import functional as F
 import spacy
 from chromadb.api.types import Documents, Embeddings
+from .text_chunking import TextChunk, EnhancedChunker
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class EnhancedEmbedder:
     def __init__(self):
+
         self.model = SentenceTransformer('all-mpnet-base-v2')
+        self.chunker = EnhancedChunker()
+        
         try:
             self.nlp = spacy.load('en_core_web_sm')
         except OSError:
@@ -40,14 +44,18 @@ class EnhancedEmbedder:
         Returns:
             List of embeddings as float lists
         """
-        # Preprocess texts
-        processed_texts = [self.preprocess_text(text) for text in input]
         
+        all_chunks = []
+        for text in input:
+            chunks = self.chunker.create_chunks(text, strategy='hybrid')
+            all_chunks.extend([chunk.text for chunk in chunks])
+
         # Generate embeddings
-        embeddings = self.model.encode(processed_texts)
+        embeddings = self.model.encode(all_chunks)
         
-        # Calculate importance scores for weighting (optional)
-        importance_scores = [self.calculate_chunk_importance(text) for text in processed_texts]
+        # Calculate importance scores for weighting
+        importance_scores = [self.calculate_chunk_importance(text) for text in all_chunks]
+
         if importance_scores:
             max_score = max(importance_scores)
             importance_scores = [score/max_score for score in importance_scores]
@@ -60,6 +68,30 @@ class EnhancedEmbedder:
             embeddings = weighted_embeddings
 
         return [embedding.tolist() for embedding in embeddings]
+
+    def create_semantic_chunks(self, text: str) -> List[str]:
+        """Create semantic chunks from text"""
+        doc = self.nlp(text)
+        chunks = []
+        current_chunk = []
+        current_size = 0
+        
+        for sent in doc.sents:
+            sent_size = len(sent.text.split())
+            
+            if current_size + sent_size <= self.chunk_size:
+                current_chunk.append(sent.text)
+                current_size += sent_size
+            else:
+                if current_chunk:
+                    chunks.append(" ".join(current_chunk))
+                current_chunk = [sent.text]
+                current_size = sent_size
+        
+        if current_chunk:
+            chunks.append(" ".join(current_chunk))
+            
+        return chunks if chunks else [text]
 
     def preprocess_text(self, text: str) -> str:
         """Clean and normalize text"""
@@ -79,7 +111,128 @@ class EnhancedEmbedder:
                           and not token.is_stop) * 0.2
         
         return entity_score + noun_phrase_score + keyword_score
+
+
+class SimilarityUtils:
+    @staticmethod
+    def cosine_similarity(
+        query_embedding: Union[torch.Tensor, np.ndarray],
+        document_embeddings: Union[torch.Tensor, np.ndarray]
+    ) -> torch.Tensor:
+        """
+        Calculate cosine similarity between query and document embeddings.
+        
+        Args:
+            query_embedding: Single query embedding vector
+            document_embeddings: Matrix of document embeddings
+            
+        Returns:
+            Tensor of similarity scores for each document
+        """
+        # Convert to torch tensors if needed
+        if isinstance(query_embedding, np.ndarray):
+            query_embedding = torch.from_numpy(query_embedding)
+        if isinstance(document_embeddings, np.ndarray):
+            document_embeddings = torch.from_numpy(document_embeddings)
+        
+        # Ensure query_embedding is 2D
+        if query_embedding.dim() == 1:
+            query_embedding = query_embedding.unsqueeze(0)
+        
+        # Normalize embeddings
+        query_embedding = F.normalize(query_embedding, p=2, dim=1)
+        document_embeddings = F.normalize(document_embeddings, p=2, dim=1)
+        
+        # Calculate cosine similarity
+        similarities = torch.mm(query_embedding, document_embeddings.t())
+        return similarities.squeeze()
+
+    @staticmethod
+    def rank_documents(
+        similarities: torch.Tensor,
+        documents: List[str],
+        metadatas: List[Dict],
+        top_k: int = 5,
+        threshold: float = 0.5,
+        similarity_weight: float = 0.7,
+        importance_weight: float = 0.3
+    ) -> List[Dict]:
+        """
+        Rank documents based on similarities and metadata importance.
+        
+        Args:
+            similarities: Tensor of similarity scores
+            documents: List of document texts
+            metadatas: List of document metadata dictionaries
+            top_k: Number of top documents to return
+            threshold: Minimum score threshold
+            similarity_weight: Weight for similarity score in final ranking
+            importance_weight: Weight for importance score in final ranking
+            
+        Returns:
+            List of dictionaries containing ranked documents with scores
+        """
+        # Convert similarities to numpy for easier handling
+        similarities = similarities.cpu().numpy()
+        
+        # Combine with metadata importance scores
+        ranked_results = []
+        for i, (sim_score, doc, meta) in enumerate(zip(similarities, documents, metadatas)):
+            # Get importance score from metadata if available
+            importance = meta.get('importance_score', 0.5)
+            
+            # Calculate final score (weighted combination)
+            final_score = (sim_score * similarity_weight) + (importance * importance_weight)
+            
+            # Only include if above threshold
+            if final_score >= threshold:
+                ranked_results.append({
+                    'text': doc,
+                    'similarity': float(sim_score),
+                    'importance': importance,
+                    'final_score': float(final_score),
+                    'metadata': meta
+                })
+        
+        # Sort by final score and get top_k
+        ranked_results.sort(key=lambda x: x['final_score'], reverse=True)
+        return ranked_results[:top_k]
     
+    @staticmethod
+    def get_similar_chunks(
+        query_embedding: Union[torch.Tensor, np.ndarray],
+        chunk_embeddings: Union[torch.Tensor, np.ndarray],
+        chunks: List[str],
+        min_similarity: float = 0.5
+    ) -> List[Tuple[str, float]]:
+        """
+        Find similar chunks based on cosine similarity.
+        
+        Args:
+            query_embedding: Query embedding vector
+            chunk_embeddings: Matrix of chunk embeddings
+            chunks: List of text chunks
+            min_similarity: Minimum similarity threshold
+            
+        Returns:
+            List of tuples containing (chunk_text, similarity_score)
+        """
+        # Calculate similarities
+        similarities = SimilarityUtils.cosine_similarity(query_embedding, chunk_embeddings)
+        
+        # Convert to numpy
+        similarities = similarities.cpu().numpy()
+        
+        # Filter and sort results
+        similar_chunks = []
+        for chunk, score in zip(chunks, similarities):
+            if score >= min_similarity:
+                similar_chunks.append((chunk, float(score)))
+        
+        # Sort by similarity score
+        similar_chunks.sort(key=lambda x: x[1], reverse=True)
+        return similar_chunks
+
 class LLMManager:
     def __init__(self):
         self.base_url = "http://ollama.easystreet.studio:11434/api"
@@ -88,83 +241,46 @@ class LLMManager:
         self.chroma_client = None
         self.embedder = None
         self.embedding_function = EnhancedEmbedder()
-        self.system_prompt = """You are the friendly and knowledgeable digital concierge for The Sunshine Ranch, a premier event and wedding venue nestled in the scenic Northwest. Your role is to provide warm, engaging responses while guiding potential clients toward booking their special day or event with us. With our breathtaking views, rustic elegance, and versatile spaces, we create unforgettable experiences for every occasion.
+        self.system_prompt = """You are the welcoming digital concierge for The Sunshine Ranch, a premier Northwest wedding and event venue. Use the following retrieved context to answer the question. If you don't know the answer, just say you don't know. Use three sentences maximum and keep the answer concise.
 
-Key Traits:
-- Be warm and welcoming, showing genuine excitement about each inquiry
-- Give clear, specific answers that highlight our venue's unique features
-- Naturally weave in suggestions that encourage venue visits or bookings
-- When appropriate, mention our private tours or consultation options
-- Share relevant details that paint a picture of their perfect event at our venue
-- Emphasize our venue's versatility for both indoor and outdoor events
-- Highlight our stunning natural surroundings and photo opportunities
-- Mention our spacious facilities and guest accommodation capabilities
+Core Guidelines:
+- Highlight relevant venue features and capabilities
+- Guide conversations toward bookings, tours, or consultations
+- Keep responses concise, elegant, and upscale in tone
+- For unavailable information, direct to thesunshineranch.events@gmail.com
 
-Response Guidelines:
-1. Always maintain an enthusiastic, helpful tone
-2. After answering the main question, add ONE short follow-up that builds interest
-   Example: "Would you like to schedule a private tour to see our stunning mountain views in person?"
-3. Keep initial responses concise but inviting
-4. Use elegant, upscale language that matches our venue's sophistication
-5. For specific questions outside your knowledge, suggest contacting our events team
-6. If you don't know the answer, do not make one up. Simply tell the user you don't have the information on hand and guide them to send us an email
-    Example: "I'm sorry, but I don't have the answer to your question. If you would like to know more, please send us an email and we will respond back quickly."
-7. If you are asked about booking a date, please tell them to send us an email.
-    Example: "I'm sorry, but I don't have access at this time to the venue calendar. Please email us and we will check on those dates for you."
+Key Features to Reference:
+- Outdoor ceremony spaces with mountain/orchard backdrop
+- Elegant reception areas with rustic charm
+- Weather-flexible indoor/outdoor options
+- Private bridal suite and prep areas
+- Professional event coordination
+- Custom lighting and décor options
+- Comprehensive vendor amenities
+- Easy accessibility and ample parking
 
-Converting Inquiries:
-- For pricing questions: Share basic information but emphasize the value and suggest a consultation
-- For availability: Encourage quick action as dates can fill quickly
-- For venue features: Paint a picture of their event while highlighting unique amenities
-- For general inquiries: Always guide toward the next step (tour, consultation, etc.)
+Standard Responses:
+1. For date inquiries: "To check specific dates, please email thesunshineranch.events@gmail.com"
+2. For detailed pricing: "While our packages start at $4999.00, I'd love to arrange a consultation to discuss your specific needs"
+3. For availability: "Our dates are filling quickly. Let's schedule a tour to explore your options"
 
-Venue Highlights to Weave In:
-- Beautiful outdoor ceremony spaces with mountain and orchard backdrop
-- Elegant outdoor reception area with rustic charm
-- Spacious grounds for outdoor celebrations
-- Dedicated areas for wedding party preparation
-- Flexible vendor policies
-- Ample offsite parking and accessibility
-- Professional event coordination support
-- Various rental packages to suit different needs
-- Beautiful photo opportunities throughout the property
-- Comfortable guest capacity up to 300
+Remember: Share venue highlights naturally, and sometimes conclude with ONE engagement prompt (e.g., "Would you like to schedule a private tour?")
 
-Special Features to Mention When Relevant:
-- Custom lighting options for evening events
-- Multiple ceremony location options
-- Covered outdoor areas for weather flexibility
-- Private bridal suite room
-- ADA accessibility throughout
-- Vendor preparation areas
-- Weather contingency options
-- Scenic backdrop for photography
+Context: {context}
+Question: {question}"""
 
-Booking Process Emphasis:
-1. Encourage booking a private tour as the first step
-2. Mention our event coordination team's expertise
-3. Highlight the benefits of early booking
-4. Emphasize the personalized attention we provide
-5. Mention our flexible payment plans when relevant
-
-Remember: Your goal is to make each potential client feel excited about hosting their event at The Sunshine Ranch while gently guiding them toward taking the next step in their booking journey. Always convey our commitment to making their special day truly memorable.
-
-Context for this response:
-{context}
-
-Current question: {question}
-
-Respond warmly and directly, then add one natural follow-up that encourages further engagement:"""
-    
     def initialize_models(self):
         try:
             logger.info("Starting initialization...")
-            # Initialize ChromaDB with enhanced embedder
+            # Initialize ChromaDB with metadata filtering capability
             self.chroma_client = chromadb.PersistentClient(path=settings.CHROMA_DB_PATH)
             self.collection = self.chroma_client.get_or_create_collection(
                 name="knowledge_base",
                 embedding_function=self.embedding_function
             )
+            
+            # Initialize embedding model
+            self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
             
             # Check Ollama connection
             response = requests.get(f"{self.base_url}/tags")
@@ -174,6 +290,73 @@ Respond warmly and directly, then add one natural follow-up that encourages furt
             logger.info("Initialization complete!")
         except Exception as e:
             logger.error(f"Error during initialization: {str(e)}")
+            raise
+    
+    def reset_and_initialize_chroma(self):
+        """Reset ChromaDB and initialize with MPNet embeddings"""
+        try:
+            logger.info("Starting ChromaDB reset and initialization...")
+            
+            # 1. First, close any existing ChromaDB connections
+            if self.collection is not None:
+                # Delete all documents from existing collection
+                try:
+                    results = self.collection.get()
+                    if results['ids']:
+                        self.collection.delete(ids=results['ids'])
+                    logger.info("Existing documents deleted")
+                except Exception as e:
+                    logger.warning(f"Error clearing collection: {str(e)}")
+            
+            if self.chroma_client is not None:
+                try:
+                    self.chroma_client.reset()
+                    logger.info("ChromaDB client reset")
+                except Exception as e:
+                    logger.warning(f"Error resetting client: {str(e)}")
+            
+            # 2. Initialize new ChromaDB client
+            self.chroma_client = chromadb.PersistentClient(path=settings.CHROMA_DB_PATH)
+            
+            # 3. Delete and recreate collection
+            try:
+                self.chroma_client.delete_collection("knowledge_base")
+                logger.info("Old collection deleted")
+            except Exception as e:
+                logger.info("No existing collection to delete")
+            
+            # 4. Create new collection with MPNet embedding function
+            self.collection = self.chroma_client.create_collection(
+                name="knowledge_base",
+                embedding_function=self.embedding_function,
+                metadata={"description": "Knowledge base using MPNet embeddings (768 dimensions)"}
+            )
+            
+            logger.info("ChromaDB reset and initialized successfully with MPNet embeddings")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error during ChromaDB reset: {str(e)}")
+            raise
+
+    # Test function to verify embedding dimensions
+    def verify_embedding_dimensions(self):
+        """Verify that the embeddings are 768-dimensional (MPNet)"""
+        try:
+            # Create a test embedding
+            test_text = ["This is a test document"]
+            test_embedding = self.embedding_function(test_text)[0]
+            
+            # Check dimensions
+            embedding_dim = len(test_embedding)
+            logger.info(f"Embedding dimensions: {embedding_dim}")
+            
+            if embedding_dim != 768:
+                raise ValueError(f"Unexpected embedding dimensions: {embedding_dim} (expected 768)")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error verifying embedding dimensions: {str(e)}")
             raise
 
     def _clean_response(self, text: str) -> str:
@@ -204,16 +387,59 @@ Respond warmly and directly, then add one natural follow-up that encourages furt
         
         return enhanced_query
 
-    def add_to_knowledge_base(self, text: str, metadata: Optional[Dict] = None) -> str:
-        """Enhanced document addition with better chunking and metadata"""
+    def _prepare_metadata_for_chroma(self, metadata: Dict) -> Dict:
+        """
+        Convert metadata values to ChromaDB-compatible types
+        """
+        prepared_metadata = {}
+        for key, value in metadata.items():
+            if isinstance(value, (str, int, float, bool)):
+                prepared_metadata[key] = value
+            elif isinstance(value, list):
+                # Convert lists to comma-separated strings
+                prepared_metadata[key] = ','.join(str(item) for item in value)
+            elif isinstance(value, dict):
+                # Convert dictionaries to JSON strings
+                prepared_metadata[key] = json.dumps(value)
+            elif value is None:
+                # Handle None values
+                prepared_metadata[key] = ''
+            else:
+                # Convert any other types to strings
+                prepared_metadata[key] = str(value)
+        return prepared_metadata
+
+    def add_to_knowledge_base(
+        self, 
+        text: str, 
+        metadata: Optional[Dict] = None,
+        chunk_size: int = 512,
+        chunk_overlap: int = 50
+    ) -> Union[str, List[str]]:
+        """
+        Add document to knowledge base with improved chunking and metadata handling
+        """
         try:
-            # Create semantic chunks
-            chunks = self.embedding_function.create_semantic_chunks(text)
-            
-            # Initialize metadata if None
-            if metadata is None:
+            # Validate metadata
+            if not metadata:
                 metadata = {}
-            
+            if 'timestamp' not in metadata:
+                metadata['timestamp'] = datetime.utcnow().isoformat()
+            if 'status' not in metadata:
+                metadata['status'] = 'active'
+
+            # Create chunks if text is too long
+            chunks = []
+            if len(text.split()) > chunk_size:
+                # Improved chunking with overlap
+                words = text.split()
+                for i in range(0, len(words), chunk_size - chunk_overlap):
+                    chunk = ' '.join(words[i:i + chunk_size])
+                    chunks.append(chunk)
+            else:
+                chunks = [text]
+
+            # Add each chunk to the collection
             doc_ids = []
             for i, chunk in enumerate(chunks):
                 # Create chunk-specific metadata
@@ -221,104 +447,292 @@ Respond warmly and directly, then add one natural follow-up that encourages furt
                 chunk_metadata.update({
                     'chunk_index': i,
                     'total_chunks': len(chunks),
-                    'original_text_length': len(text),
-                    'chunk_length': len(chunk)
+                    'chunk_size': len(chunk.split()),
+                    'is_chunked': len(chunks) > 1
                 })
                 
-                # Generate doc ID
-                doc_id = f"doc_{len(self.collection.get()['ids']) + 1}_{i}"
+                # Prepare metadata for ChromaDB
+                prepared_metadata = self._prepare_metadata_for_chroma(chunk_metadata)
+                
+                # Generate or use provided document ID
+                doc_id = chunk_metadata.get('document_id', 
+                    f"doc_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{i}")
                 
                 # Add to collection
                 self.collection.add(
                     documents=[chunk],
-                    metadatas=[chunk_metadata],
+                    metadatas=[prepared_metadata],
                     ids=[doc_id]
                 )
-                
                 doc_ids.append(doc_id)
 
-            return doc_ids[0]  # Return first chunk ID as reference
+            return doc_ids[0] if len(doc_ids) == 1 else doc_ids
             
         except Exception as e:
             logger.error(f"Error adding to knowledge base: {str(e)}")
             raise
     
-    def query_knowledge_base(self, query: str, n_results: int = 5) -> List[str]:
-        """Enhanced query processing with better ranking"""
+    def _convert_stored_metadata(self, metadata: Dict) -> Dict:
+        """
+        Convert stored metadata back to original types
+        """
+        converted = {}
+        for key, value in metadata.items():
+            if key in ['categories', 'tags', 'keywords']:
+                # Convert comma-separated strings back to lists
+                converted[key] = value.split(',') if value else []
+            elif key in ['properties', 'config', 'settings']:
+                # Convert JSON strings back to dictionaries
+                try:
+                    converted[key] = json.loads(value)
+                except (json.JSONDecodeError, TypeError):
+                    converted[key] = value
+            else:
+                converted[key] = value
+        return converted
+
+    def query_knowledge_base(self, query: str, n_results: int = 2) -> List[str]:
+        """Enhanced query processing with explicit cosine similarity"""
         try:
             # Preprocess query
             processed_query = self.embedding_function.preprocess_text(query)
             
-            # Get results with metadata
-            results = self.collection.query(
-                query_texts=[processed_query],
-                n_results=n_results * 2,  # Get more results for reranking
-                include=['documents', 'metadatas', 'distances']
-            )
+            # Get query embedding
+            query_embedding = self.embedding_function([processed_query])[0]
             
-            if not results['documents'][0]:
+            # Get all documents and their data
+            results = self.collection.get()
+            
+            # Check if we have any documents
+            if not results['ids'] or not results['documents']:
+                logger.info("No documents found in collection")
+                return []
+                
+            documents = results['documents']
+            embeddings = results['embeddings']
+            metadatas = results['metadatas']
+            
+            # Verify we have matching lengths
+            if not (len(documents) == len(embeddings) == len(metadatas)):
+                logger.error(f"Mismatched lengths: docs={len(documents)}, embeddings={len(embeddings)}, metadata={len(metadatas)}")
                 return []
 
-            # Combine results with distances for reranking
-            combined_results = []
-            for doc, meta, dist in zip(
-                results['documents'][0],
-                results['metadatas'][0],
-                results['distances'][0]
-            ):
-                # Calculate relevance score
-                relevance = 1 / (1 + dist)  # Convert distance to similarity
-                
-                # Get chunk importance (if available)
-                importance = meta.get('importance_score', 0.5)
-                
-                # Calculate final score
-                final_score = (relevance * 0.7) + (importance * 0.3)
-                
-                combined_results.append({
-                    'text': doc,
-                    'score': final_score,
-                    'metadata': meta
-                })
+            # Calculate similarities using SimilarityUtils
+            similarities = SimilarityUtils.cosine_similarity(
+                query_embedding=np.array(query_embedding),
+                document_embeddings=np.array(embeddings)
+            )
             
-            # Sort by final score and get top n_results
-            combined_results.sort(key=lambda x: x['score'], reverse=True)
-            top_results = combined_results[:n_results]
+            # Rank documents with custom weights and thresholds
+            ranked_results = SimilarityUtils.rank_documents(
+                similarities=similarities,
+                documents=documents,
+                metadatas=metadatas,
+                top_k=n_results,
+                threshold=0.5,  # Minimum relevance threshold
+                similarity_weight=0.7,  # Weight for similarity in final score
+                importance_weight=0.3   # Weight for metadata importance
+            )
             
-            # Extract and return texts
-            return [result['text'] for result in top_results]
+            # Extract and return the text from ranked results
+            return [result['text'] for result in ranked_results]
 
+        except IndexError as e:
+            logger.error(f"Index error in query_knowledge_base: {str(e)}")
+            return []
         except Exception as e:
-            logger.error(f"Error querying knowledge base: {str(e)}")
+            logger.error(f"Error in enhanced query: {str(e)}")
             return []
 
-    def generate_response(self, prompt: str, max_length: Optional[int] = None, temperature: Optional[float] = None) -> str:
-        """Generate response with enhanced context integration"""
+    def get_document(self, doc_id: str) -> Optional[Dict]:
+        """
+        Retrieve a document and its metadata by ID, converting metadata back to original types
+        """
         try:
-            # Get relevant context with improved retrieval
-            context = self.query_knowledge_base(prompt)
+            result = self.collection.get(
+                ids=[doc_id],
+                include=['documents', 'metadatas']
+            )
             
-            # Process and combine context
-            if context:
-                # Remove duplicate information
-                seen_content = set()
-                unique_context = []
-                for c in context:
-                    if c not in seen_content:
-                        unique_context.append(c)
-                        seen_content.add(c)
+            if not result['ids']:
+                return None
+            
+            # Convert metadata back to original types
+            metadata = self._convert_stored_metadata(result['metadatas'][0])
+                    
+            return {
+                'id': doc_id,
+                'text': result['documents'][0],
+                'metadata': metadata
+            }
+            
+        except Exception as e:
+            logger.error(f"Error retrieving document: {str(e)}")
+            raise
+
+    def update_document_metadata(self, doc_id: str, metadata: Dict) -> bool:
+        """
+        Update metadata for a specific document
+        
+        Args:
+            doc_id: Document identifier
+            metadata: New metadata dictionary
+            
+        Returns:
+            Boolean indicating success
+        """
+        try:
+            # Get existing document
+            doc = self.get_document(doc_id)
+            if not doc:
+                return False
+            
+            # Update the document with new metadata
+            self.collection.update(
+                ids=[doc_id],
+                metadatas=[metadata]
+            )
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error updating document metadata: {str(e)}")
+            return False
+        
+    def get_document_similarities(self, query: str) -> List[Dict]:
+        """
+        Get detailed similarity information for debugging and analysis.
+        Returns full similarity information including scores.
+        """
+        try:
+            # Preprocess and embed query
+            processed_query = self.embedding_function.preprocess_text(query)
+            query_embedding = self.embedding_function([processed_query])[0]
+            
+            # Get collection data
+            results = self.collection.get()
+            
+            # Check if we have data
+            if not results['ids'] or not results['documents']:
+                logger.info("No documents found for similarity calculation")
+                return []
                 
-                context_str = "\n\nRelevant Information:\n" + "\n".join(
-                    f"- {c}" for c in unique_context
-                )
-            else:
-                context_str = "No specific venue details found for this query."
+            # Verify embeddings exist
+            if 'embeddings' not in results or not results['embeddings']:
+                logger.error("No embeddings found in results")
+                return []
+                
+            # Calculate similarities
+            similarities = SimilarityUtils.cosine_similarity(
+                query_embedding=np.array(query_embedding),
+                document_embeddings=np.array(results['embeddings'])
+            )
+            
+            # Get full ranking information
+            ranked_docs = SimilarityUtils.rank_documents(
+                similarities=similarities,
+                documents=results['documents'],
+                metadatas=results['metadatas'],
+                top_k=len(results['documents']),  # Get all documents
+                threshold=0.0  # No threshold to see all scores
+            )
+            
+            return ranked_docs
+            
+        except Exception as e:
+            logger.error(f"Error getting similarities: {str(e)}")
+            return []
+
+    # def generate_response(self,
+    #     prompt: str,
+    #     context: Optional[List[str]] = None,
+    #     metadata_filters: Optional[Dict] = None,
+    #     max_length: Optional[int] = None,
+    #     temperature: Optional[float] = None) -> str:
+
+    #     """Generate response with enhanced context integration"""
+    #     try:
+    #        # Get context if not provided
+    #         if context is None:
+    #             context = self.query_knowledge_base(
+    #                 query=prompt,
+    #                 filters=metadata_filters
+    #             )
+            
+    #         context_str = "\n".join(context) if context else "No specific venue details found."
+
+    #         # Format prompt with context
+    #         formatted_prompt = self.system_prompt.format(
+    #             context=context_str,
+    #             question=prompt
+    #         )
+
+    #         # Process and combine context
+    #         if context:
+    #             # Remove duplicate information
+    #             seen_content = set()
+    #             unique_context = []
+    #             for c in context:
+    #                 if c not in seen_content:
+    #                     unique_context.append(c)
+    #                     seen_content.add(c)
+                
+    #             context_str = "\n\nRelevant Information:\n" + "\n".join(
+    #                 f"- {c}" for c in unique_context
+    #             )
+    #         else:
+    #             context_str = "No specific venue details found for this query."
+
+    #         # Format prompt with context
+    #         formatted_prompt = self.system_prompt.format(
+    #             context=context_str,
+    #             question=prompt
+    #         )
+
+    #         # Generate response
+    #         data = {
+    #             "model": self.model,
+    #             "prompt": formatted_prompt,
+    #             "stream": False,
+    #             "temperature": temperature or settings.DEFAULT_TEMPERATURE,
+    #             "max_length": max_length or settings.MAX_LENGTH
+    #         }
+            
+    #         response = requests.post(f"{self.base_url}/generate", json=data)
+            
+    #         if response.status_code == 200:
+    #             response_text = response.json()["response"].strip()
+    #             return self._clean_response(response_text)
+    #         else:
+    #             raise Exception(f"Error from Ollama API: {response.text}")
+            
+    #     except Exception as e:
+    #         logger.error(f"Error during response generation: {str(e)}")
+    #         raise
+
+    def generate_response(
+        self,
+        prompt: str,
+        max_length: Optional[int] = None,
+        temperature: Optional[float] = None
+    ) -> str:
+        """Generate response with enhanced logging"""
+        try:
+            logger.info(f"Starting generate_response with prompt: {prompt[:100]}...")
+            logger.info(f"Parameters - max_length: {max_length}, temperature: {temperature}")
+            
+            # Get relevant context
+            logger.info("Querying knowledge base...")
+            context = self.query_knowledge_base(prompt)
+            context_str = "\n".join(context) if context else "No specific venue details found."
+            logger.info(f"Retrieved context length: {len(context_str)}")
 
             # Format prompt with context
             formatted_prompt = self.system_prompt.format(
                 context=context_str,
                 question=prompt
             )
+            logger.info(f"Formatted prompt length: {len(formatted_prompt)}")
 
             # Generate response
             data = {
@@ -329,16 +743,39 @@ Respond warmly and directly, then add one natural follow-up that encourages furt
                 "max_length": max_length or settings.MAX_LENGTH
             }
             
+            logger.info(f"Sending request to Ollama API at {self.base_url}")
             response = requests.post(f"{self.base_url}/generate", json=data)
             
+            # Log response status and headers
+            logger.info(f"Ollama API response status: {response.status_code}")
+            logger.info(f"Ollama API response headers: {dict(response.headers)}")
+            
             if response.status_code == 200:
-                response_text = response.json()["response"].strip()
-                return self._clean_response(response_text)
+                response_json = response.json()
+                logger.info("Successfully received JSON response from Ollama")
+                
+                if "response" not in response_json:
+                    logger.error(f"Unexpected response format: {response_json}")
+                    raise ValueError("Invalid response format from Ollama API")
+                
+                response_text = response_json["response"].strip()
+                cleaned_response = response_text.replace("Assistant:", "").replace("User:", "").strip()
+                logger.info(f"Final response length: {len(cleaned_response)}")
+                return cleaned_response
             else:
+                logger.error(f"Error response from Ollama API: {response.text}")
                 raise Exception(f"Error from Ollama API: {response.text}")
             
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Network error with Ollama API: {str(e)}")
+            raise
+        except json.JSONDecodeError as e:
+            logger.error(f"Error decoding Ollama API response: {str(e)}")
+            raise
         except Exception as e:
-            logger.error(f"Error during response generation: {str(e)}")
+            logger.error(f"Error in generate_response: {str(e)}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             raise
 
     def _clean_response(self, text: str) -> str:
@@ -353,32 +790,49 @@ Respond warmly and directly, then add one natural follow-up that encourages furt
         self,
         search_term: str = "",
         page: int = 1,
-        page_size: int = 10
+        page_size: int = 10,
+        filters: Optional[Dict] = None
     ) -> Dict[str, Any]:
-        """List documents with pagination and search"""
-        try:
-            # Get all documents
-            result = self.collection.get()
-            documents = []
+        """
+        List documents with enhanced filtering and pagination
+        
+        Args:
+            search_term: Optional search string
+            page: Page number
+            page_size: Items per page
+            filters: Optional metadata filters
             
-            # Combine document data
-            for i in range(len(result['ids'])):
+        Returns:
+            Dictionary containing paginated documents and metadata
+        """
+        try:
+            # Prepare where clauses for filtering
+            where = {}
+            if filters:
+                for key, value in filters.items():
+                    if key in ['categories', 'content_type', 'target_audience', 'status']:
+                        where[key] = value
+
+            # Get all matching documents
+            result = self.collection.get(
+                where=where,
+                include=['documents', 'metadatas']
+            )
+
+            documents = []
+            for i, doc_id in enumerate(result['ids']):
                 doc = {
-                    'id': result['ids'][i],
+                    'id': doc_id,
                     'text': result['documents'][i],
                     'metadata': result['metadatas'][i]
                 }
+                
+                # Apply text search if provided
+                if search_term and search_term.lower() not in doc['text'].lower():
+                    continue
+                    
                 documents.append(doc)
-            
-            # Filter by search term if provided
-            if search_term:
-                documents = [
-                    doc for doc in documents
-                    if search_term.lower() in doc['text'].lower() or
-                    any(search_term.lower() in str(v).lower() 
-                        for v in doc['metadata'].values())
-                ]
-            
+
             # Calculate pagination
             total = len(documents)
             start_idx = (page - 1) * page_size
@@ -388,7 +842,8 @@ Respond warmly and directly, then add one natural follow-up that encourages furt
                 'documents': documents[start_idx:end_idx],
                 'total': total,
                 'page': page,
-                'page_size': page_size
+                'page_size': page_size,
+                'total_pages': (total + page_size - 1) // page_size
             }
             
         except Exception as e:
@@ -396,18 +851,31 @@ Respond warmly and directly, then add one natural follow-up that encourages furt
             raise
     
     def delete_document(self, doc_id: str) -> bool:
-        """Delete a document from the knowledge base"""
+        """Delete a document and its chunks"""
         try:
-            # Check if document exists
-            result = self.collection.get(ids=[doc_id])
-            if not result['ids']:
+            # Get document to check if it's chunked
+            doc = self.get_document(doc_id)
+            if not doc:
                 return False
-            
-            self.collection.delete(ids=[doc_id])
+                
+            # If document is chunked, delete all related chunks
+            if doc['metadata'].get('is_chunked'):
+                base_id = doc_id.rsplit('_', 1)[0]
+                # Get all chunks
+                chunks = self.collection.get(
+                    where={"document_id": base_id}
+                )
+                # Delete all chunks
+                self.collection.delete(ids=chunks['ids'])
+            else:
+                # Delete single document
+                self.collection.delete(ids=[doc_id])
+                
             return True
+            
         except Exception as e:
             logger.error(f"Error deleting document: {str(e)}")
-            raise
+            return False
 
     def _is_document_relevant(self, document: str, metadata: dict) -> bool:
         """
@@ -464,3 +932,23 @@ Respond warmly and directly, then add one natural follow-up that encourages furt
             expanded_terms.extend(synonyms.get(term, []))
         
         return ' '.join(expanded_terms)
+    
+    def check_collection_status(self) -> Dict:
+        """Check the status of the ChromaDB collection"""
+        try:
+            results = self.collection.get()
+            return {
+                'document_count': len(results['ids']),
+                'has_embeddings': 'embeddings' in results and bool(results['embeddings']),
+                'has_metadata': 'metadatas' in results and bool(results['metadatas']),
+                'sample_ids': results['ids'][:5] if results['ids'] else []
+            }
+        except Exception as e:
+            logger.error(f"Error checking collection status: {str(e)}")
+            return {
+                'error': str(e),
+                'document_count': 0,
+                'has_embeddings': False,
+                'has_metadata': False,
+                'sample_ids': []
+            }

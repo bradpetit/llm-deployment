@@ -13,7 +13,13 @@ import docx
 from datetime import datetime
 import logging
 
+# Import our new metadata generator
+from .metadata_generator import EnhancedMetadataGenerator
+
 logger = logging.getLogger(__name__)
+
+# Initialize the metadata generator
+metadata_generator = EnhancedMetadataGenerator()
 
 class MetadataExtractor:
     @staticmethod
@@ -109,6 +115,71 @@ class MetadataExtractor:
             return max(category_scores.items(), key=lambda x: x[1])[0]
         return 'general'
 
+class DocumentProcessor:
+    """Handles document processing and content extraction"""
+    
+    @staticmethod
+    def extract_content(file_bytes: bytes, filename: str) -> tuple[str, dict]:
+        """Extract content and basic file info from uploaded file"""
+        file_info = {
+            'filename': filename,
+            'size': len(file_bytes),
+            'upload_date': datetime.now().isoformat()
+        }
+        
+        if filename.lower().endswith('.pdf'):
+            content = DocumentProcessor._extract_pdf_content(file_bytes)
+            file_info['content_type'] = 'application/pdf'
+        elif filename.lower().endswith('.docx'):
+            content = DocumentProcessor._extract_docx_content(file_bytes)
+            file_info['content_type'] = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        elif filename.lower().endswith('.txt'):
+            content = file_bytes.decode('utf-8')
+            file_info['content_type'] = 'text/plain'
+        else:
+            raise ValueError(f"Unsupported file type: {filename}")
+            
+        return content, file_info
+
+    @staticmethod
+    def _extract_pdf_content(file_bytes: bytes) -> str:
+        """Extract text content from PDF"""
+        try:
+            pdf_file = BytesIO(file_bytes)
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            
+            # Extract text from all pages
+            content = []
+            for page in pdf_reader.pages:
+                content.append(page.extract_text())
+                
+            return '\n'.join(content)
+        except Exception as e:
+            logger.error(f"Error extracting PDF content: {str(e)}")
+            raise
+
+    @staticmethod
+    def _extract_docx_content(file_bytes: bytes) -> str:
+        """Extract text content from DOCX"""
+        try:
+            doc = docx.Document(BytesIO(file_bytes))
+            content = []
+            
+            # Extract text from paragraphs
+            for paragraph in doc.paragraphs:
+                content.append(paragraph.text)
+                
+            # Extract text from tables
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        content.append(cell.text)
+                        
+            return '\n'.join(content)
+        except Exception as e:
+            logger.error(f"Error extracting DOCX content: {str(e)}")
+            raise
+
 # Router setup
 router = APIRouter()
 security = HTTPBasic()
@@ -123,7 +194,7 @@ def get_current_admin(credentials: HTTPBasicCredentials = Depends(security)):
     
     if not (is_correct_username and is_correct_password):
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
+            status_code="HTTP_401_UNAUTHORIZED",
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Basic"},
         )
@@ -136,23 +207,124 @@ async def admin_interface(_: str = Depends(get_current_admin)):
     with open(html_path, "r") as f:
         return f.read()
 
+@router.get("/admin/document/{doc_id}/metadata")
+async def get_document_metadata(
+    doc_id: str,
+    _: str = Depends(get_current_admin)
+):
+    """Get detailed metadata for a specific document"""
+    try:
+        from app.main import llm_manager
+        
+        # Get document
+        doc = llm_manager.get_document(doc_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+            
+        # Generate metadata summary
+        metadata_summary = metadata_generator.export_metadata_summary(doc['metadata'])
+        
+        return {
+            'metadata': doc['metadata'],
+            'summary': metadata_summary
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting document metadata: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@router.put("/admin/document/{doc_id}/metadata")
+async def update_document_metadata(
+    doc_id: str,
+    updates: dict,
+    _: str = Depends(get_current_admin)
+):
+    """Update metadata for a specific document"""
+    try:
+        from app.main import llm_manager
+        
+        # Get existing document
+        doc = llm_manager.get_document(doc_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+            
+        # Update metadata
+        updated_metadata = metadata_generator.update_metadata(
+            content=doc['text'],
+            existing_metadata=doc['metadata'],
+            update_fields=updates.get('fields')
+        )
+        
+        # Save updated metadata
+        success = llm_manager.update_document_metadata(doc_id, updated_metadata)
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to update metadata")
+            
+        return {
+            'message': 'Metadata updated successfully',
+            'metadata': updated_metadata
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating document metadata: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @router.get("/admin/documents")
 async def list_documents(
     _: str = Depends(get_current_admin),
     page: int = Query(1, ge=1),
     search: str = Query(""),
-    page_size: int = Query(10, ge=1, le=100)
+    page_size: int = Query(10, ge=1, le=100),
+    category: Optional[str] = Query(None),
+    content_type: Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None)
 ):
-    """List documents with pagination and search"""
+    """List documents with enhanced filtering and search"""
     try:
         from app.main import llm_manager
+        
+        # Get base document list
         documents = llm_manager.list_documents(
             search_term=search,
             page=page,
             page_size=page_size
         )
+        
+        # Apply additional filters if specified
+        filtered_docs = []
+        for doc in documents['documents']:
+            # Skip if document doesn't match category filter
+            if category and category not in doc.get('metadata', {}).get('categories', []):
+                continue
+                
+            # Skip if document doesn't match content type filter
+            if content_type and content_type != doc.get('metadata', {}).get('content_type'):
+                continue
+                
+            # Skip if document is outside date range
+            doc_date = doc.get('metadata', {}).get('timestamp')
+            if doc_date:
+                if date_from and doc_date < date_from:
+                    continue
+                if date_to and doc_date > date_to:
+                    continue
+                    
+            # Document passed all filters
+            filtered_docs.append(doc)
+        
+        # Update response with filtered documents
+        documents['documents'] = filtered_docs
+        documents['total'] = len(filtered_docs)
+        
         return documents
+        
     except Exception as e:
+        logger.error(f"Error listing documents: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/admin/upload")
@@ -161,64 +333,56 @@ async def upload_files(
     metadata_json: Optional[str] = Form(None),
     _: str = Depends(get_current_admin)
 ):
-    """Handle file upload with automatic metadata extraction"""
+    """Handle file upload with enhanced metadata extraction"""
     try:
         from app.main import llm_manager
         
         # Read file content
         content = await file.read()
         
-        # Extract base metadata
-        base_metadata = {
-            'filename': file.filename,
-            'content_type': file.content_type,
-            'size': len(content),
-            'upload_date': datetime.now().isoformat(),
-            'source': 'file_upload'
-        }
+        # Extract content and basic file info
+        text_content, file_info = DocumentProcessor.extract_content(content, file.filename)
         
-        # Extract format-specific metadata
-        if file.filename.lower().endswith('.pdf'):
-            file_metadata = MetadataExtractor.extract_pdf_metadata(content)
-            text = PyPDF2.PdfReader(BytesIO(content)).pages[0].extract_text()
-        elif file.filename.lower().endswith('.docx'):
-            file_metadata = MetadataExtractor.extract_docx_metadata(content)
-            doc = docx.Document(BytesIO(content))
-            text = '\n'.join(paragraph.text for paragraph in doc.paragraphs)
-        elif file.filename.lower().endswith('.txt'):
-            text = content.decode('utf-8')
-            file_metadata = MetadataExtractor.extract_txt_metadata(text)
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported file type: {file.filename}"
-            )
-
-        # Combine metadata sources
-        combined_metadata = {
-            **base_metadata,
-            **file_metadata
-        }
-        
-        # Add user-provided metadata if any
+        # Parse user-provided metadata if any
+        user_metadata = {}
         if metadata_json:
             try:
                 user_metadata = json.loads(metadata_json)
-                combined_metadata.update(user_metadata)
             except json.JSONDecodeError:
                 logger.warning("Invalid metadata JSON provided")
-
+        
+        # Generate enhanced metadata
+        metadata = metadata_generator.generate_metadata(
+            content=text_content,
+            file_info=file_info,
+            existing_metadata=user_metadata
+        )
+        
+        # Validate metadata
+        validation_issues = metadata_generator.validate_metadata(metadata)
+        if validation_issues:
+            logger.warning(f"Metadata validation issues: {validation_issues}")
+            metadata['validation_warnings'] = validation_issues
+        
         # Add to knowledge base
         doc_id = llm_manager.add_to_knowledge_base(
-            text=text,
-            metadata=combined_metadata
+            text=text_content,
+            metadata=metadata
         )
+        
+        # Generate a human-readable summary for the response
+        metadata_summary = metadata_generator.export_metadata_summary(metadata)
 
         return {
             'message': 'File uploaded successfully',
             'doc_id': doc_id,
-            'metadata': combined_metadata
+            'metadata_summary': metadata_summary,
+            'metadata': metadata
         }
+        
+    except ValueError as ve:
+        logger.error(f"Validation error during file upload: {str(ve)}")
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         logger.error(f"Error during file upload: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
